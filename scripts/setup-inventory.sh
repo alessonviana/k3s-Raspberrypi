@@ -167,8 +167,8 @@ echo "  Flannel Backend: $FLANNEL_BACKEND"
 echo "  Master IP (para kubeconfig): $FIRST_MASTER_IP"
 echo ""
 
-read -p "Confirm and generate files\? (s/N): " CONFIRM
-if [[ ! $CONFIRM =~ ^[Ss]$ ]]; then
+read -p "Confirm and generate files\? (Y/N): " CONFIRM
+if [[ ! $CONFIRM =~ ^[Yy]$ ]]; then
     echo "❌ Operation cancelled\."
     exit 1
 fi
