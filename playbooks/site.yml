@@ -1,0 +1,108 @@
+---
+# Main playbook for k3s cluster deployment
+# This playbook orchestrates the complete cluster installation
+
+- name: Complete k3s cluster deployment
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Verify connectivity with all machines
+      ping:
+
+- import_playbook: k3s-master.yml
+
+- import_playbook: k3s-workers.yml
+
+- name: Verify cluster status
+  hosts: k3s_master
+  become: yes
+  tasks:
+    - name: Wait for all nodes to register
+      pause:
+        seconds: 10
+
+    - name: Check cluster nodes
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: nodes
+      changed_when: false
+
+    - name: Display cluster nodes
+      debug:
+        var: nodes.stdout_lines
+
+- name: Copy kubeconfig to local machine
+  hosts: k3s_master
+  become: yes
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/k3s_cluster.yml
+  vars:
+    local_kube_dir: "{{ lookup('env', 'HOME') }}/.kube"
+    local_kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/k3s-config"
+  tasks:
+    - name: Get local user home directory
+      set_fact:
+        local_home: "{{ lookup('env', 'HOME') }}"
+      delegate_to: localhost
+      become: no
+      run_once: true
+
+    - name: Create local .kube directory if it doesn't exist
+      file:
+        path: "{{ local_home }}/.kube"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+      run_once: true
+
+    - name: Copy kubeconfig from master to local machine
+      fetch:
+        src: "/home/{{ default_user }}/.kube/config"
+        dest: "{{ local_home }}/.kube/k3s-config"
+        flat: yes
+      delegate_to: localhost
+      become: no
+      run_once: true
+      register: kubeconfig_fetch
+
+    - name: Set correct permissions on local kubeconfig
+      file:
+        path: "{{ local_home }}/.kube/k3s-config"
+        mode: '0600'
+      delegate_to: localhost
+      become: no
+      run_once: true
+      when: kubeconfig_fetch is succeeded
+
+    - name: Verify if IP in kubeconfig is correct
+      lineinfile:
+        path: "{{ local_home }}/.kube/k3s-config"
+        regexp: '^\s*server:\s*https://127.0.0.1:6443'
+        line: "    server: https://{{ k3s_master_ip }}:6443"
+        backup: yes
+      delegate_to: localhost
+      become: no
+      run_once: true
+      when: kubeconfig_fetch is succeeded
+
+    - name: Display kubeconfig information
+      debug:
+        msg:
+          - "✅ Kubeconfig copied successfully!"
+          - "📁 Location: {{ local_home }}/.kube/k3s-config"
+          - ""
+          - "To use the kubeconfig, run:"
+          - "  export KUBECONFIG={{ local_home }}/.kube/k3s-config"
+          - "  kubectl get nodes"
+          - ""
+          - "Or add to your ~/.bashrc or ~/.zshrc:"
+          - "  export KUBECONFIG=$HOME/.kube/k3s-config"
+      delegate_to: localhost
+      become: no
+      run_once: true
+      when: kubeconfig_fetch is succeeded
+

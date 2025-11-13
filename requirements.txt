@@ -1,0 +1,6 @@
+# Requisitos do projeto Ansible
+# Instalar com: pip3 install -r requirements.txt
+
+ansible>=2.9.0
+ansible-lint>=5.0.0
+

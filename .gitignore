@@ -1,0 +1,39 @@
+# Ansible
+*.retry
+*.log
+
+# Inventário (contém informações sensíveis - IPs, usuários, etc.)
+inventory/hosts.yml
+!inventory/hosts.yml.example
+
+# Senhas (contém informações sensíveis)
+inventory/.passwords.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ansible facts cache
+/tmp/ansible_facts/
+
+# Arquivos temporários
+*.tmp
+*.bak
+

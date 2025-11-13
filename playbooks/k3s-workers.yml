@@ -1,0 +1,205 @@
+---
+- name: Configure and install k3s workers
+  hosts: k3s_workers
+  become: yes
+  gather_facts: yes
+  vars:
+    k3s_role: agent
+  vars_files:
+    - ../group_vars/k3s_cluster.yml
+  handlers:
+    - name: reboot_required
+      debug:
+        msg: "⚠️  Reboot required to apply cgroup settings. Run: sudo reboot"
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install dependencies
+      apt:
+        name:
+          - curl
+          - wget
+          - iptables
+        state: present
+
+    - name: Read token from master
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_file
+      delegate_to: "{{ groups['k3s_master'][0] }}"
+      become: yes
+
+    - name: Set k3s token
+      set_fact:
+        k3s_token: "{{ k3s_token_file.content | b64decode | trim }}"
+      when: k3s_token_file is not failed
+
+    - name: Validate that token was obtained
+      fail:
+        msg: "k3s token not found. Run the master playbook first and ensure k3s is running."
+      when: k3s_token is not defined or k3s_token == "" or k3s_token | length == 0
+
+    - name: Check if cmdline.txt exists
+      stat:
+        path: /boot/firmware/cmdline.txt
+      register: cmdline_stat
+
+    - name: Read current cmdline
+      slurp:
+        src: /boot/firmware/cmdline.txt
+      register: cmdline_content
+      when: cmdline_stat.stat.exists
+
+    - name: Configure cgroups on Raspberry Pi (if necessary)
+      lineinfile:
+        path: /boot/firmware/cmdline.txt
+        regexp: '^(.*)$'
+        line: '\1 cgroup_memory=1 cgroup_enable=memory'
+        backrefs: yes
+        backup: no
+        unsafe_writes: yes
+      when: 
+        - cmdline_stat.stat.exists
+        - ansible_facts['architecture'] == 'aarch64' or ansible_facts['architecture'] == 'armv7l'
+        - not (cmdline_content.content | b64decode | regex_search('cgroup_memory=1'))
+      notify: reboot_required
+
+    - name: Get k3s version installed on master
+      command: /usr/local/bin/k3s --version
+      register: k3s_version_output
+      delegate_to: "{{ groups['k3s_master'][0] }}"
+      become: yes
+      failed_when: false
+      changed_when: false
+
+    - name: Extract k3s version from master
+      set_fact:
+        k3s_master_version: "{{ k3s_version_output.stdout | regex_search('(v[0-9.]+\\+k3s[0-9]+)') | first | default('') }}"
+      when: k3s_version_output is defined and k3s_version_output.rc == 0
+
+    - name: Set k3s version for workers
+      set_fact:
+        k3s_worker_version: "{{ k3s_master_version | default(k3s_version | default('')) }}"
+
+    - name: Check if k3s-agent is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_installed
+
+    - name: Download and install k3s (worker)
+      shell: |
+        {% if k3s_worker_version != "" %}
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_worker_version }} K3S_URL={{ k3s_master_url }} K3S_TOKEN={{ k3s_token }} sh -s - \
+          {{ k3s_extra_args }}
+        {% else %}
+        curl -sfL https://get.k3s.io | K3S_URL={{ k3s_master_url }} K3S_TOKEN={{ k3s_token }} sh -s - \
+          {{ k3s_extra_args }}
+        {% endif %}
+      when: not k3s_installed.stat.exists
+      register: k3s_install
+      ignore_errors: yes
+
+    - name: Check k3s-agent logs if installation failed
+      command: journalctl -u k3s-agent.service -n 50 --no-pager
+      register: k3s_logs
+      when: k3s_install is defined and k3s_install.rc is defined and k3s_install.rc != 0
+      changed_when: false
+
+    - name: Display k3s-agent logs
+      debug:
+        var: k3s_logs.stdout_lines
+      when: k3s_install is defined and k3s_install.rc is defined and k3s_install.rc != 0
+
+    - name: Try to start k3s-agent service
+      systemd:
+        name: k3s-agent
+        state: started
+        enabled: yes
+      when: k3s_install is not defined or (k3s_install.rc is defined and k3s_install.rc == 0)
+      ignore_errors: yes
+      register: k3s_service_start
+
+    - name: Check k3s-agent logs if service failed
+      command: journalctl -u k3s-agent.service -n 100 --no-pager
+      register: k3s_service_logs
+      when: k3s_service_start.failed | default(false)
+      changed_when: false
+
+    - name: Display k3s-agent service logs
+      debug:
+        var: k3s_service_logs.stdout_lines
+      when: k3s_service_start.failed | default(false)
+
+    - name: Check k3s-agent service status before waiting
+      command: systemctl is-active k3s-agent
+      register: k3s_service_status
+      changed_when: false
+      failed_when: false
+      when: k3s_install is not defined or (k3s_install.rc is defined and k3s_install.rc == 0)
+
+    - name: Check k3s-agent logs if service is not active
+      command: journalctl -u k3s-agent.service -n 100 --no-pager
+      register: k3s_status_logs
+      when: 
+        - (k3s_install is not defined or (k3s_install.rc is defined and k3s_install.rc == 0))
+        - k3s_service_status.rc != 0
+      changed_when: false
+
+    - name: Display k3s-agent logs
+      debug:
+        var: k3s_status_logs.stdout_lines
+      when: 
+        - (k3s_install is not defined or (k3s_install.rc is defined and k3s_install.rc == 0))
+        - k3s_service_status.rc != 0
+
+    - name: Wait for k3s-agent to start
+      wait_for:
+        path: /etc/rancher/k3s/k3s-agent.yaml
+        timeout: 120
+        delay: 5
+      when: k3s_install is not defined or (k3s_install.rc is defined and k3s_install.rc == 0)
+      ignore_errors: yes
+      register: k3s_wait_result
+
+    - name: Check logs if k3s-agent did not start
+      command: journalctl -u k3s-agent.service -n 200 --no-pager
+      register: k3s_final_logs
+      when: k3s_wait_result.failed | default(false)
+      changed_when: false
+
+    - name: Display final k3s-agent logs
+      debug:
+        var: k3s_final_logs.stdout_lines
+      when: k3s_wait_result.failed | default(false)
+
+    - name: Fail if k3s-agent did not start
+      fail:
+        msg: |
+          k3s-agent did not start correctly. Check the logs above.
+          Possible causes:
+          - Cgroups not configured (requires reboot)
+          - Connectivity issues with master
+          - Invalid or expired token
+          - Firewall blocking communication
+          Execute: sudo journalctl -u k3s-agent.service -f
+      when: k3s_wait_result.failed | default(false)
+
+    - name: Check k3s-agent status
+      command: systemctl status k3s-agent
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
+    - name: Display k3s-agent status
+      debug:
+        var: k3s_status.stdout_lines
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+

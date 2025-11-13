@@ -1,0 +1,360 @@
+---
+- name: Configure and install k3s master
+  hosts: k3s_master
+  become: yes
+  gather_facts: yes
+  vars:
+    k3s_role: server
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/k3s_cluster.yml
+  handlers:
+    - name: reboot_required
+      debug:
+        msg: "⚠️  Reboot required to apply cgroup settings. Run: sudo reboot"
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install dependencies
+      apt:
+        name:
+          - curl
+          - wget
+          - vim
+          - htop
+          - iptables
+        state: present
+
+    - name: Check if cmdline.txt exists
+      stat:
+        path: /boot/firmware/cmdline.txt
+      register: cmdline_stat
+
+    - name: Check if cmdline.txt exists (alternativa)
+      stat:
+        path: /boot/cmdline.txt
+      register: cmdline_stat_alt
+
+    - name: Read current cmdline
+      slurp:
+        src: "{{ '/boot/firmware/cmdline.txt' if cmdline_stat.stat.exists else '/boot/cmdline.txt' }}"
+      register: cmdline_content
+      when: cmdline_stat.stat.exists or cmdline_stat_alt.stat.exists
+
+    - name: Check cgroup version
+      command: stat -fc %T /sys/fs/cgroup/
+      register: cgroup_version
+      changed_when: false
+      failed_when: false
+
+    - name: Display cgroup version
+      debug:
+        msg: "Cgroup version detected: {{ cgroup_version.stdout }}"
+
+    - name: Configure cgroups v2 on Raspberry Pi (if necessary)
+      lineinfile:
+        path: "{{ '/boot/firmware/cmdline.txt' if cmdline_stat.stat.exists else '/boot/cmdline.txt' }}"
+        regexp: '^(.*)$'
+        line: '\1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory systemd.unified_cgroup_hierarchy=1'
+        backrefs: yes
+        backup: no
+        unsafe_writes: yes
+      when: 
+        - (cmdline_stat.stat.exists or cmdline_stat_alt.stat.exists)
+        - ansible_facts['architecture'] == 'aarch64' or ansible_facts['architecture'] == 'armv7l'
+        - not (cmdline_content.content | b64decode | regex_search('systemd.unified_cgroup_hierarchy=1'))
+      notify: reboot_required
+
+    - name: Warn about required reboot
+      debug:
+        msg: |
+          ⚠️  IMPORTANT: Cgroup settings have been modified.
+          You MUST reboot the machine for changes to take effect:
+          
+          sudo reboot
+          
+          After rebooting, run the playbook again.
+      when: 
+        - (cmdline_stat.stat.exists or cmdline_stat_alt.stat.exists)
+        - ansible_facts['architecture'] == 'aarch64' or ansible_facts['architecture'] == 'armv7l'
+        - not (cmdline_content.content | b64decode | regex_search('systemd.unified_cgroup_hierarchy=1'))
+
+    - name: Check if cgroup v2 is enabled before installing
+      command: test -d /sys/fs/cgroup/system.slice
+      register: cgroup_v2_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check available cgroup controllers
+      command: cat /sys/fs/cgroup/cgroup.controllers
+      register: cgroup_controllers
+      changed_when: false
+      failed_when: false
+      when: cgroup_v2_check.rc == 0
+
+    - name: Display available cgroup controllers
+      debug:
+        msg: "Available cgroup controllers: {{ cgroup_controllers.stdout }}"
+      when: cgroup_v2_check.rc == 0
+
+    - name: Try to enable memory controller in cgroup v2
+      shell: |
+        echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control
+      when: 
+        - cgroup_v2_check.rc == 0
+        - "'memory' not in cgroup_controllers.stdout"
+      changed_when: true
+      failed_when: false
+      register: enable_memory_controller
+
+    - name: Check controllers after attempt to enable
+      command: cat /sys/fs/cgroup/cgroup.controllers
+      register: cgroup_controllers_after
+      changed_when: false
+      failed_when: false
+      when: 
+        - cgroup_v2_check.rc == 0
+        - "'memory' not in cgroup_controllers.stdout"
+
+    - name: Set compatible k3s version if memory controller is not available
+      set_fact:
+        k3s_version_compatible: "v1.28.0+k3s1"
+      when: 
+        - cgroup_v2_check.rc == 0
+        - "'memory' not in (cgroup_controllers_after.stdout | default(cgroup_controllers.stdout))"
+        - k3s_version == "" or k3s_version is not defined
+
+    - name: Warn about using compatible k3s version
+      debug:
+        msg: |
+          ⚠️  The memory controller is not available in cgroup v2.
+          
+          Available controllers: {{ cgroup_controllers_after.stdout | default(cgroup_controllers.stdout) }}
+          
+          Using compatible k3s version: {{ k3s_version_compatible }}
+          This version does not require cgroup v2 with memory controller.
+          
+          If you want to use the latest version, you need to:
+          1. Reboot the machine: sudo reboot
+          2. If the problem persists, update the kernel:
+             sudo apt update && sudo apt upgrade -y
+      when: 
+        - cgroup_v2_check.rc == 0
+        - "'memory' not in (cgroup_controllers_after.stdout | default(cgroup_controllers.stdout))"
+        - k3s_version == "" or k3s_version is not defined
+
+    - name: Fail if memory controller is not available and specific version was requested
+      fail:
+        msg: |
+          ❌ The memory controller is not available in cgroup v2.
+          
+          Available controllers: {{ cgroup_controllers_after.stdout | default(cgroup_controllers.stdout) }}
+          
+          You specified a k3s version ({{ k3s_version }}) that requires cgroup v2 with memory controller.
+          
+          Solutions:
+          1. Reboot the machine: sudo reboot
+          2. If the problem persists, update the kernel:
+             sudo apt update && sudo apt upgrade -y
+          3. Or use an older k3s version:
+             Configure k3s_version: "v1.28.0+k3s1" in group_vars/k3s_cluster.yml
+      when: 
+        - cgroup_v2_check.rc == 0
+        - "'memory' not in (cgroup_controllers_after.stdout | default(cgroup_controllers.stdout))"
+        - k3s_version != "" and k3s_version is defined
+
+    - name: Warn if cgroup v2 is not enabled
+      fail:
+        msg: |
+          ❌ Cgroup v2 is not enabled. The machine needs to be rebooted.
+          
+          Run:
+            sudo reboot
+          
+          Then run the playbook again.
+          
+          Note: The playbook has already configured cmdline.txt, but reboot is required.
+      when: cgroup_v2_check.rc != 0
+
+    - name: Set final k3s version to be installed
+      set_fact:
+        k3s_install_version: "{{ k3s_version_compatible | default(k3s_version | default('')) }}"
+
+    - name: Download and install k3s (master)
+      shell: |
+        {% if k3s_install_version != "" %}
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_install_version }} sh -s - \
+          --node-ip {{ k3s_master_ip }} \
+          --flannel-backend {{ k3s_flannel_backend }} \
+          {{ k3s_extra_args }}
+        {% else %}
+        curl -sfL https://get.k3s.io | sh -s - \
+          --node-ip {{ k3s_master_ip }} \
+          --flannel-backend {{ k3s_flannel_backend }} \
+          {{ k3s_extra_args }}
+        {% endif %}
+      args:
+        creates: /usr/local/bin/k3s
+      register: k3s_install
+      ignore_errors: yes
+
+    - name: Check k3s logs if installation failed
+      command: journalctl -u k3s.service -n 50 --no-pager
+      register: k3s_logs
+      when: k3s_install.rc != 0
+      changed_when: false
+
+    - name: Display k3s logs
+      debug:
+        var: k3s_logs.stdout_lines
+      when: k3s_install.rc != 0
+
+    - name: Try to start k3s service
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+      when: k3s_install.rc == 0 or k3s_install.rc is not defined
+      ignore_errors: yes
+      register: k3s_service_start
+
+    - name: Check k3s logs if service failed
+      command: journalctl -u k3s.service -n 100 --no-pager
+      register: k3s_service_logs
+      when: k3s_service_start.failed | default(false)
+      changed_when: false
+
+    - name: Display k3s service logs
+      debug:
+        var: k3s_service_logs.stdout_lines
+      when: k3s_service_start.failed | default(false)
+
+    - name: Check k3s service status before waiting
+      command: systemctl is-active k3s
+      register: k3s_service_status
+      changed_when: false
+      failed_when: false
+      when: k3s_install.rc == 0 or k3s_install.rc is not defined
+
+    - name: Check k3s logs if service is not active
+      command: journalctl -u k3s.service -n 100 --no-pager
+      register: k3s_status_logs
+      when: 
+        - (k3s_install.rc == 0 or k3s_install.rc is not defined)
+        - k3s_service_status.rc != 0
+      changed_when: false
+
+    - name: Display k3s logs
+      debug:
+        var: k3s_status_logs.stdout_lines
+      when: 
+        - (k3s_install.rc == 0 or k3s_install.rc is not defined)
+        - k3s_service_status.rc != 0
+
+    - name: Wait for k3s to start
+      wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+        timeout: 120
+        delay: 5
+      when: k3s_install.rc == 0 or k3s_install.rc is not defined
+      ignore_errors: yes
+      register: k3s_wait_result
+
+    - name: Check logs if k3s did not start
+      command: journalctl -u k3s.service -n 200 --no-pager
+      register: k3s_final_logs
+      when: k3s_wait_result.failed | default(false)
+      changed_when: false
+
+    - name: Display final k3s logs
+      debug:
+        var: k3s_final_logs.stdout_lines
+      when: k3s_wait_result.failed | default(false)
+
+    - name: Fail if k3s did not start
+      fail:
+        msg: |
+          k3s did not start correctly. Check the logs above.
+          Possible causes:
+          - Cgroups not configured (requires reboot)
+          - Memory or resource issues
+          - Port or network conflicts
+          Run: sudo journalctl -u k3s.service -f
+      when: k3s_wait_result.failed | default(false)
+
+    - name: Read k3s token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_file
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
+    - name: Set k3s token as fact variable
+      set_fact:
+        k3s_token: "{{ k3s_token_file.content | b64decode | trim }}"
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+        - k3s_token_file is not failed
+
+    - name: Display k3s token (debug only)
+      debug:
+        msg: "k3s token: {{ k3s_token }}"
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+        - k3s_token is defined
+
+    - name: Create .kube directory in user home
+      file:
+        path: "/home/{{ default_user }}/.kube"
+        state: directory
+        owner: "{{ default_user }}"
+        group: "{{ default_user }}"
+        mode: '0755'
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
+    - name: Copy kubeconfig to user
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ default_user }}/.kube/config"
+        owner: "{{ default_user }}"
+        group: "{{ default_user }}"
+        mode: '0600'
+        remote_src: yes
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
+    - name: Update kubeconfig with correct IP
+      lineinfile:
+        path: "/home/{{ default_user }}/.kube/config"
+        regexp: '^\s*server:\s*https://127.0.0.1:6443'
+        line: "    server: https://{{ k3s_master_ip }}:6443"
+        backup: yes
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
+    - name: Check k3s status
+      command: systemctl status k3s
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
+    - name: Display k3s status
+      debug:
+        var: k3s_status.stdout_lines
+      when: 
+        - k3s_wait_result is not failed
+        - k3s_wait_result is defined
+
