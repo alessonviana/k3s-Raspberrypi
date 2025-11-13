@@ -469,13 +469,6 @@ chmod 600 ~/.kube/k3s-config
 - [Ansible documentation](https://docs.ansible.com/)
 - [Kubernetes Documentation](https://kubernetes.io/docs/)
 
-## 📄 License
-
-This project is publicly available on GitHub.
-
-## 👤 Author
-
-Project created for k3s cluster deployment on Raspberry Pi 4.
 
 ---
 
